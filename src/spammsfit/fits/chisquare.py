@@ -1,10 +1,12 @@
 """Grid-based chi-square fitting for SPAMMSFit."""
 from __future__ import annotations
+import multiprocessing as mp
 import time
 from pathlib import Path
 from typing import Any
 import numpy as np
 import pandas as pd
+from tqdm.auto import tqdm
 from spammsfit.core import EvaluationDetails, SpammsFit
 from spammsfit.fits.base import BaseFit
 from spammsfit.forward.output import ModelSpectra
@@ -17,6 +19,109 @@ GLOBAL_PARAMETERS = ("teff", "r_pole", "mass", "inclination", "v_crit_frac")
 SIGMA_PARAMETERS = ( "sigma_R", "sigma_T")
 GRID_PARAMETERS = (*GLOBAL_PARAMETERS, *SIGMA_PARAMETERS)
 REQUIRED_INDEX_COLUMNS = { "model_id", "line_name", "profile_path", "profile_exists", *GRID_PARAMETERS}
+# Each worker receives the observed arrays once when it starts. This avoids
+# repeatedly serializing the same spectra for every grid-model task.
+_WORKER_OBSERVED: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] | None = None
+_WORKER_INDEX_DIRECTORY: Path | None = None
+_WORKER_EXTRAPOLATE = True
+
+
+def _initialize_chisquare_worker(observed_lines: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]], index_directory: Path, extrapolate: bool) -> None:
+    """Initialize one chi-square worker process."""
+    global _WORKER_OBSERVED, _WORKER_INDEX_DIRECTORY, _WORKER_EXTRAPOLATE
+    _WORKER_OBSERVED = observed_lines
+    _WORKER_INDEX_DIRECTORY = index_directory
+    _WORKER_EXTRAPOLATE = extrapolate
+
+def _resolve_worker_profile_path(profile_path: str) -> Path:
+    """Resolve one absolute or model-index-relative profile path."""
+    if _WORKER_INDEX_DIRECTORY is None:
+        raise RuntimeError("Chi-square worker has not been initialized.")
+    path = Path(profile_path).expanduser()
+    if not path.is_absolute():
+        path = _WORKER_INDEX_DIRECTORY / path
+    path = path.resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"Grid profile not found: {path}")
+    return path
+
+def _read_worker_model_profile(profile_path: Path) -> tuple[np.ndarray, np.ndarray]:
+    """Read and validate one stored grid profile inside a worker."""
+    try:
+        model = np.loadtxt(profile_path, dtype=np.float64, usecols=(0, 1))
+    except (OSError, ValueError) as error:
+        raise RuntimeError(f"Could not read grid profile: {profile_path}") from error
+    model = np.atleast_2d(model)
+    if model.shape[0] < 2:
+        raise ValueError(f"Grid profile contains fewer than two pixels: {profile_path}")
+    model_wave = np.ascontiguousarray(model[:, 0], dtype=np.float64)
+    model_flux = np.ascontiguousarray(model[:, 1], dtype=np.float64)
+    if not np.all(np.isfinite(model_wave)):
+        raise ValueError(f"Non-finite wavelengths in {profile_path}.")
+    if not np.all(np.isfinite(model_flux)):
+        raise ValueError(f"Non-finite fluxes in {profile_path}.")
+    if not np.all(np.diff(model_wave) > 0.0):
+        raise ValueError(f"Wavelengths are not strictly increasing in {profile_path}.")
+    return model_wave, model_flux
+
+
+def _worker_compare_profile(line_name: str, profile_path: str) -> tuple[float, int]:
+    """Compare one model profile with its observed line inside a worker."""
+    if _WORKER_OBSERVED is None:
+        raise RuntimeError("Chi-square worker has not been initialized.")
+
+    observed_wave, observed_flux, observed_uncertainty = _WORKER_OBSERVED[line_name]
+    model_wave, model_flux = _read_worker_model_profile(_resolve_worker_profile_path(profile_path))
+    interpolated_flux = interpolate_model(model_wavelength=model_wave, model_flux=model_flux, observed_wavelength=observed_wave, extrapolate=_WORKER_EXTRAPOLATE)
+    line_chi2 = chi_square(observed_flux=observed_flux, model_flux=interpolated_flux, uncertainty=observed_uncertainty)
+    return float(line_chi2), int(observed_wave.size)
+
+def _evaluate_shared_sigma_task(task: dict[str, Any] | None) -> tuple[dict[str, Any] | None, list[dict[str, Any]], int]:
+    """Evaluate one complete shared-sigma grid model."""
+    if task is None:
+        return None, [], 0
+    total_chi2 = 0.0
+    total_pixels = 0
+    line_records: list[dict[str, Any]] = []
+
+    for line_name, profile_path, sigma_R, sigma_T in task["profiles"]:
+        line_chi2, n_pixels = _worker_compare_profile(line_name, profile_path)
+        total_chi2 += line_chi2
+        total_pixels += n_pixels
+        line_records.append({"model_id": task["model_id"], "line_name": line_name, "chi2_line": line_chi2, "n_pix_line": n_pixels,
+                            "sigma_R": sigma_R, "sigma_T": sigma_T, "profile_path": profile_path})
+    global_record = { "model_id": task["model_id"], "chi2_total": total_chi2, 
+                    "red_chi2": reduced_chi_square( chi2=total_chi2, n_pixels=total_pixels, n_free_parameters=task["n_free"]),
+                    "n_pix_total": total_pixels, **task["parameters"]}
+    return global_record, line_records, len(line_records)
+
+def _evaluate_per_line_sigma_task(task: dict[str, Any] | None) -> tuple[dict[str, Any] | None, list[dict[str, Any]], int]:
+    """Evaluate one shared-global grid point with line-specific sigmas."""
+    if task is None:
+        return None, [], 0
+    total_chi2 = 0.0
+    total_pixels = 0
+    evaluations = 0
+    line_records: list[dict[str, Any]] = []
+
+    for line_name, candidates in task["line_candidates"]:
+        best_record: dict[str, Any] | None = None
+        for model_id, profile_path, sigma_R, sigma_T in candidates:
+            line_chi2, n_pixels = _worker_compare_profile(line_name, profile_path)
+            evaluations += 1
+            if best_record is None or line_chi2 < best_record["chi2_line"]:
+                best_record = {**task["parameters"], "line_name": line_name,  "model_id": model_id, "chi2_line": line_chi2,
+                            "n_pix_line": n_pixels, "sigma_R": sigma_R, "sigma_T": sigma_T, "profile_path": profile_path}
+        if best_record is None:
+            return None, [], evaluations
+        total_chi2 += best_record["chi2_line"]
+        total_pixels += best_record["n_pix_line"]
+        line_records.append(best_record)
+
+    global_record = {**task["parameters"], "chi2_total": total_chi2, 
+                    "red_chi2": reduced_chi_square( chi2=total_chi2, n_pixels=total_pixels, n_free_parameters=task["n_free"]),
+                    "n_pix_total": total_pixels}
+    return global_record, line_records, evaluations
 
 class ChiSquareFit(BaseFit):
     """
@@ -39,11 +144,18 @@ class ChiSquareFit(BaseFit):
             raise ValueError( "sigma_mode must be either 'shared' or 'per_line' ")
         self._n_profile_evaluations = 0
         
-    def run(self) -> ChiSquareResult:
-        """Execute the grid-based chi-square search. Returns : ChiSquareResult -> Ranked global and line-level grid results."""
+    def run( self, *, ncores: int = 1, chunksize: int = 100, progress: bool = True) -> ChiSquareResult:
+        """
+        Execute the grid-based chi-square search.
+        ncores: Number of worker processes. Use one for serial execution.
+        chunksize: Number of grid tasks dispatched to each worker at a time.
+        progress: Display a tqdm progress bar while evaluating the grid.
+        Returns -> ChiSquareResult: Ranked global and line-level grid results.
+        """
         self._start_run()
         calculation_start = time.perf_counter()
         try:
+            ncores, chunksize = self._validate_parallel_settings( ncores=ncores, chunksize=chunksize)
             self._validate_parameter_configuration()
             model_index = self._read_model_index()
             initial_rows = len(model_index)
@@ -53,9 +165,9 @@ class ChiSquareFit(BaseFit):
                 raise ValueError("No grid models available for the used parameter constraints.")
             self._n_profile_evaluations = 0
             if self.sigma_mode == "shared":
-                global_table, line_table = self._fit_shared_sigma(filtered_index)
+                global_table, line_table = self._fit_shared_sigma(filtered_index, ncores=ncores, chunksize=chunksize, progress=progress)
             else:
-                global_table, line_table = self._fit_per_line_sigma(filtered_index)
+                global_table, line_table = self._fit_per_line_sigma(filtered_index, ncores=ncores, chunksize=chunksize, progress=progress)
             if global_table.empty:
                 raise RuntimeError("The grid search produced no valid global solutions.")
             if line_table.empty:
@@ -81,8 +193,8 @@ class ChiSquareFit(BaseFit):
                     "initial_unique_models": initial_models,
                     "filtered_index_rows": len(filtered_index),
                     "filtered_unique_models":filtered_index["model_id"].nunique(),
-                    }
-                )
+                    "ncores": ncores,
+                    "chunksize": chunksize})
 
         except Exception as error:
             self._fail_run(error)
@@ -133,22 +245,36 @@ class ChiSquareFit(BaseFit):
                 filtered = filtered[keep]
         return filtered.reset_index(drop=True)
 
-    def _fit_shared_sigma(self, model_index: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    def _fit_shared_sigma(self, model_index: pd.DataFrame, *, ncores: int, chunksize: int, progress: bool) -> tuple[pd.DataFrame, pd.DataFrame]:
         """
         Fit one shared sigma_R and sigma_T pair across all lines.
         """
+        tasks = self._build_shared_sigma_tasks(model_index)
+        global_records, line_records = self._execute_tasks( worker=_evaluate_shared_sigma_task, tasks=tasks, ncores=ncores, chunksize=chunksize, progress=progress,
+            description="Chi-square grid")
+        return self._make_global_table(global_records), pd.DataFrame(line_records)
+        
+    def _fit_per_line_sigma(self, model_index: pd.DataFrame, *, ncores: int, chunksize: int, progress: bool) -> tuple[pd.DataFrame, pd.DataFrame]:
+        """
+        Fit independent sigma_R and sigma_T values for every line.
+        """
+        tasks = self._build_per_line_sigma_tasks(model_index)
+        global_records, line_records = self._execute_tasks( worker=_evaluate_per_line_sigma_task, tasks=tasks, ncores=ncores, chunksize=chunksize, progress=progress,
+            description="Chi-square global grid")
+        return self._make_global_table(global_records), pd.DataFrame(line_records)
+
+    def _build_shared_sigma_tasks(self, model_index: pd.DataFrame) -> list[dict[str, Any] | None]:
+        """Build one compact task for every shared-sigma model."""
         selected_lines = self.spamms_fit.spectrum.line_names
-        global_records: list[dict[str, Any]] = []
-        line_records: list[dict[str, Any]] = []
-        model_groups = model_index.groupby("model_id", sort=False)
-        for model_id, model_group in model_groups:
+        n_free = self._effective_n_free()
+        tasks: list[dict[str, Any] | None] = []
+        for model_id, model_group in model_index.groupby("model_id", sort=False):
             first = model_group.iloc[0]
-            total_chi2 = 0.0
-            total_pixels = 0
+            profiles: list[tuple[str, str, float | int, float | int]] = []
             valid_model = True
-            current_line_records: list[dict[str, Any]] = []
+            
             for line_name in selected_lines:
-                line_rows = model_group[model_group["line_name"]== line_name]
+                line_rows = model_group[model_group["line_name"] == line_name]
                 if len(line_rows) != 1:
                     valid_model = False
                     break
@@ -156,97 +282,76 @@ class ChiSquareFit(BaseFit):
                 if not bool(row["profile_exists"]):
                     valid_model = False
                     break
-                line_chi2, n_pixels = self._compare_profile(line_name=line_name, profile_path=row["profile_path"])
-                total_chi2 += line_chi2
-                total_pixels += n_pixels
-                current_line_records.append(
-                    {"model_id": model_id,
-                    "line_name": line_name,
-                    "chi2_line": line_chi2,
-                    "n_pix_line": n_pixels,
-                    "sigma_R": self._scalar(row["sigma_R"]),
-                    "sigma_T": self._scalar(row["sigma_T"]),
-                    "profile_path": str(row["profile_path"]),
-                    })
-
+                profiles.append((line_name, str(row["profile_path"]), self._scalar(row["sigma_R"]), self._scalar(row["sigma_T"])))
             if not valid_model:
+                tasks.append(None)
                 continue
-            n_free = self._effective_n_free()
-            reduced = reduced_chi_square(chi2=total_chi2, n_pixels=total_pixels, n_free_parameters=n_free)
-            global_records.append(
-                    {"model_id": model_id,
-                    "chi2_total": total_chi2,
-                    "red_chi2": reduced,
-                    "n_pix_total": total_pixels,
-                    "teff": self._scalar(first["teff"]),
-                    "r_pole": self._scalar(first["r_pole"]),
-                    "mass": self._scalar(first["mass"]),
-                    "inclination": self._scalar(first["inclination"]),
-                    "v_crit_frac": self._scalar(first["v_crit_frac"]),
-                    "sigma_R": self._scalar(first["sigma_R"]),
-                    "sigma_T": self._scalar(first["sigma_T"]),
-                    })
-            line_records.extend(current_line_records)
-        return (self._make_global_table(global_records), pd.DataFrame(line_records))
+            tasks.append({"model_id": model_id, "profiles": tuple(profiles), "n_free": n_free, "parameters": {name: self._scalar(first[name]) for name in GRID_PARAMETERS}})
+        return tasks
 
-    def _fit_per_line_sigma(self, model_index: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-        """
-        Fit independent sigma_R and sigma_T values for every line.
-        """
+    def _build_per_line_sigma_tasks( self, model_index: pd.DataFrame) -> list[dict[str, Any] | None]:
+        """Build one compact task for every shared-global grid point."""
         selected_lines = self.spamms_fit.spectrum.line_names
-        global_records: list[dict[str, Any]] = []
-        line_records: list[ dict[str, Any]] = []
+        n_free = self._effective_n_free()
+        tasks: list[dict[str, Any] | None] = []
         grouped = model_index.groupby(list(GLOBAL_PARAMETERS), sort=False, dropna=False)
+        
         for global_values, global_group in grouped:
-            global_parameters = {
-                name: self._scalar(value)
-                for name, value in zip(GLOBAL_PARAMETERS, global_values, strict=True)
-                }
-
-            total_chi2 = 0.0
-            total_pixels = 0
+            global_parameters = {name: self._scalar(value) for name, value in zip(GLOBAL_PARAMETERS, global_values, strict=True)}
+            line_candidates: list[tuple[str, tuple[tuple[Any, str, float | int, float | int], ...]]] = []
             valid_global = True
-            current_line_records: list[dict[str, Any]] = []
+            
             for line_name in selected_lines:
-                line_rows = global_group[global_group["line_name"]== line_name]
+                line_rows = global_group[(global_group["line_name"] == line_name) & global_group["profile_exists"].astype(bool)]
                 if line_rows.empty:
                     valid_global = False
                     break
-                best_record: (dict[str, Any] | None) = None
-                for row in line_rows.itertuples(index=False):
-                    if not bool(row.profile_exists):
-                        continue
-                    line_chi2, n_pixels = self._compare_profile(line_name=line_name, profile_path= row.profile_path)
-                    if (best_record is None or line_chi2 < best_record["chi2_line"]):
-                        best_record = {
-                            **global_parameters,
-                            "line_name": line_name,
-                            "model_id": row.model_id,
-                            "chi2_line": line_chi2,
-                            "n_pix_line": n_pixels,
-                            "sigma_R": self._scalar(row.sigma_R),
-                            "sigma_T": self._scalar(row.sigma_T),
-                            "profile_path": str(row.profile_path),
-                            }
-                if best_record is None:
-                    valid_global = False
-                    break
-                total_chi2 += best_record["chi2_line"]
-                total_pixels += best_record["n_pix_line"]
-                current_line_records.append(best_record)
+                candidates = tuple((row.model_id, str(row.profile_path), self._scalar(row.sigma_R),self._scalar(row.sigma_T)) for row in line_rows.itertuples(index=False))
+                line_candidates.append((line_name, candidates))
             if not valid_global:
+                tasks.append(None)
                 continue
-            reduced = reduced_chi_square(chi2=total_chi2, n_pixels=total_pixels, n_free_parameters=self._effective_n_free())
-            global_records.append(
-                    {
-                    **global_parameters,
-                    "chi2_total": total_chi2,
-                    "red_chi2": reduced,
-                    "n_pix_total": total_pixels,
-                    })
+            tasks.append({"parameters": global_parameters, "line_candidates": tuple(line_candidates), "n_free": n_free})
+        return tasks
 
+    def _execute_tasks( self, *, worker: Any, tasks: list[dict[str, Any] | None], ncores: int, chunksize: int, progress: bool, description: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Execute serial or multiprocessing grid tasks and collect records."""
+        observed_lines = {line_name:
+                (self.spamms_fit.spectrum.get_line(line_name).wavelength,
+                self.spamms_fit.spectrum.get_line(line_name).flux,
+                self.spamms_fit.spectrum.get_line(line_name).uncertainty)
+            for line_name in self.spamms_fit.spectrum.line_names}
+        initializer_arguments = (observed_lines,self.model_index.parent, self.spamms_fit.extrapolate)
+        if ncores == 1:
+            _initialize_chisquare_worker(*initializer_arguments)
+            iterator = map(worker, tasks)
+            return self._collect_task_results(iterator=iterator, total=len(tasks), progress=progress, description=description)
+        context = mp.get_context()
+        with context.Pool( processes=ncores, initializer=_initialize_chisquare_worker, initargs=initializer_arguments) as pool:
+            iterator = pool.imap(worker, tasks, chunksize=chunksize)
+            return self._collect_task_results( iterator=iterator, total=len(tasks), progress=progress, description=description)
+
+    def _collect_task_results( self, *, iterator: Any, total: int, progress: bool, description: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Collect worker results and update the parent evaluation count."""
+        global_records: list[dict[str, Any]] = []
+        line_records: list[dict[str, Any]] = []
+        results = tqdm( iterator, total=total, desc=description, unit="model", disable=not progress)
+        for global_record, current_line_records, evaluations in results:
+            self._n_profile_evaluations += evaluations
+            if global_record is None:
+                continue
+            global_records.append(global_record)
             line_records.extend(current_line_records)
-        return self._make_global_table(global_records), pd.DataFrame(line_records)
+        return global_records, line_records
+
+    @staticmethod
+    def _validate_parallel_settings(ncores: int, chunksize: int) -> tuple[int, int]:
+        """Validate multiprocessing settings."""
+        if isinstance(ncores, bool) or int(ncores) != ncores or int(ncores) < 1:
+            raise ValueError("ncores must be an integer greater than or equal to 1.")
+        if isinstance(chunksize, bool) or int(chunksize) != chunksize or int(chunksize) < 1:
+            raise ValueError("chunksize must be an integer greater than or equal to 1.")
+        return int(ncores), int(chunksize)
 
     @staticmethod
     def _make_global_table(records: list[dict[str, Any]]) -> pd.DataFrame:
