@@ -22,7 +22,7 @@ from spammsfit.spectrum import Spectrum
 from spammsfit.utilities.grid_index import (
     create_model_index,
 )
-
+from spammsfit.results.model import ModelResult
 
 __version__ = "0.1.0"
 
@@ -40,4 +40,5 @@ __all__ = [
     "SpammsFit",
     "Spectrum",
     "create_model_index",
+    "ModelResult",
 ]

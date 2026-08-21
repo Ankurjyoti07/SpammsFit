@@ -1,7 +1,8 @@
 """Core spectral-fitting interface for SPAMMSFit."""
 from __future__ import annotations
+import time
 from collections.abc import Mapping
-from typing import Any, TypedDict
+from typing import TYPE_CHECKING, Any, TypedDict
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
 from spammsfit.configuration import SpammsConfig
@@ -12,6 +13,9 @@ from spammsfit.likelihood.interpolation import (interpolate_model)
 from spammsfit.likelihood.statistics import (chi_square, reduced_chi_square)
 from spammsfit.parameters import ParameterSet
 from spammsfit.spectrum import LineData, Spectrum
+
+if TYPE_CHECKING:
+    from spammsfit.results.model import ModelResult
 
 FloatArray = NDArray[np.float64]
 class EvaluationDetails(TypedDict):
@@ -305,9 +309,37 @@ class SpammsFit:
             theta,
         )
 
-        models = self.run_model_from_values(
+        return self.evaluate_from_values(
             parameter_values,
+            n_free_parameters=self.parameters.n_free,
         )
+
+    def evaluate_from_values(
+        self,
+        parameter_values: Mapping[str, float | int],
+        *,
+        n_free_parameters: int = 0,
+    ) -> EvaluationDetails:
+        """
+        Perform one detailed evaluation from complete named values.
+
+        Parameters
+        ----------
+        parameter_values
+            Complete numerical mapping for one SPAMMS model.
+        n_free_parameters
+            Number of parameters estimated from the data when calculating
+            reduced chi-square. Use zero for a manually selected preview.
+        """
+        if isinstance(n_free_parameters, bool) or int(n_free_parameters) != n_free_parameters:
+            raise TypeError("n_free_parameters must be an integer.")
+
+        n_free_parameters = int(n_free_parameters)
+        if n_free_parameters < 0:
+            raise ValueError("n_free_parameters cannot be negative.")
+
+        parameter_values = dict(parameter_values)
+        models = self.run_model_from_values(parameter_values)
 
         observed_wavelengths: dict[
             str,
@@ -413,9 +445,7 @@ class SpammsFit:
         reduced = reduced_chi_square(
             chi2=total_chi2,
             n_pixels=self.n_fitting_pixels,
-            n_free_parameters=(
-                self.parameters.n_free
-            ),
+            n_free_parameters=n_free_parameters,
         )
 
         return {
@@ -439,6 +469,37 @@ class SpammsFit:
             "reduced_chi2": reduced,
             "log_likelihood": log_likelihood,
         }
+
+    def preview_model(
+        self,
+        **parameter_values: float | int,
+    ) -> ModelResult:
+        """
+        Generate and evaluate one user-selected SPAMMS model.
+
+        Supplied values temporarily override the current ParameterSet
+        values. Fitting bounds and fixed/free states are ignored, and the
+        ParameterSet and original SPAMMS input file remain unchanged.
+        All lines selected in Spectrum are calculated in one SPAMMS run.
+        """
+        from spammsfit.results.model import ModelResult
+
+        preview_values = self.parameters.with_values(**parameter_values)
+        start_time = time.perf_counter()
+        evaluation = self.evaluate_from_values(
+            preview_values,
+            n_free_parameters=0,
+        )
+        runtime = time.perf_counter() - start_time
+
+        return ModelResult(
+            evaluation=evaluation,
+            runtime=runtime,
+            metadata={
+                "selected_lines": list(self.spectrum.line_names),
+                "parameter_overrides": dict(parameter_values),
+            },
+        )
 
     def _calculate_total_chi2(
         self,

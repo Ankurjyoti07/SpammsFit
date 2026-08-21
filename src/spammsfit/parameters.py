@@ -584,6 +584,27 @@ class ParameterSet:
             for name, parameter in self._parameters.items()
         }
 
+    def with_values(
+        self,
+        **parameter_values: float | int,
+    ) -> dict[str, float | int]:
+        """
+        Return current values with validated temporary overrides.
+
+        This method does not modify parameter values, fixed/free states,
+        bounds or priors. It is intended for explicit forward-model
+        calculations such as ``SpammsFit.preview_model()``.
+        """
+        values = self.current_values()
+
+        for name, value in parameter_values.items():
+            values[name] = self._prepare_value(
+                name=name,
+                value=value,
+            )
+
+        return values
+
     def fixed_values(
         self,
     ) -> dict[str, float | int]:
