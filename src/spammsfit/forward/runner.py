@@ -1,20 +1,15 @@
 """Execution of SPAMMS forward-model calculations."""
 
 from __future__ import annotations
-
 import shutil
 import subprocess
 import tempfile
 import time
 from collections.abc import Iterable, Mapping
 from pathlib import Path
-
 from spammsfit.configuration import SpammsConfig
 from spammsfit.forward.input import InputBuilder
-from spammsfit.forward.output import (
-    ModelSpectra,
-    read_model_spectra,
-)
+from spammsfit.forward.output import ModelSpectra, read_model_spectra
 
 
 class SpammsRunner:
@@ -35,33 +30,19 @@ class SpammsRunner:
     receives an independent input file and output directory.
     """
 
-    def __init__(
-        self,
-        config: SpammsConfig,
-        input_builder: InputBuilder,
-    ) -> None:
+    def __init__(self, config: SpammsConfig, input_builder: InputBuilder) -> None:
         self.config = config
         self.input_builder = input_builder
-
-        self.config.temporary_directory.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-
+        self.config.temporary_directory.mkdir(parents=True,exist_ok=True)
         self._n_requests = 0
         self._n_successful = 0
         self._n_failed = 0
-
         self._total_runtime = 0.0
         self._total_spamms_runtime = 0.0
         self._last_runtime: float | None = None
         self._last_spamms_runtime: float | None = None
 
-    def run(
-        self,
-        parameter_values: Mapping[str, float | int],
-        selected_lines: Iterable[str],
-    ) -> ModelSpectra:
+    def run(self,parameter_values: Mapping[str, float | int], selected_lines: Iterable[str]) -> ModelSpectra:
         """
         Calculate one multiline SPAMMS model.
 
@@ -80,128 +61,46 @@ class SpammsRunner:
 
         selected_lines = tuple(selected_lines)
 
-        if not selected_lines:
-            raise ValueError(
-                "At least one spectral line must be selected."
-            )
-
+        if not selected_lines:raise ValueError("At least one spectral line must be selected.")
         self._n_requests += 1
-
         run_start = time.perf_counter()
         spamms_runtime: float | None = None
         run_succeeded = False
-
-        temporary_directory = Path(
-            tempfile.mkdtemp(
-                prefix="spamms_",
-                dir=self.config.temporary_directory,
-            )
-        ).resolve()
-
+        temporary_directory = Path(tempfile.mkdtemp(prefix="spamms_",dir=self.config.temporary_directory)).resolve()
         input_file = temporary_directory / "input.txt"
         output_directory = temporary_directory / "output"
-
         try:
             output_directory.mkdir()
-
-            input_text = self.input_builder.build(
-                parameter_values=parameter_values,
-                selected_lines=selected_lines,
-                output_directory=output_directory,
-            )
-
-            input_file.write_text(
-                input_text,
-                encoding="utf-8",
-            )
-
-            command = self.config.command(
-                input_file=input_file,
-            )
-
+            input_text = self.input_builder.build(parameter_values=parameter_values,selected_lines=selected_lines,output_directory=output_directory)
+            input_file.write_text(input_text,encoding="utf-8")
+            command = self.config.command(input_file=input_file)
             spamms_start = time.perf_counter()
-
-            process = subprocess.run(
-                command,
-                cwd=self.config.spamms_directory,
-                env=self.config.subprocess_environment(),
-                stdout=(
-                    subprocess.DEVNULL
-                    if self.config.suppress_stdout
-                    else None
-                ),
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=self.config.timeout,
-                check=False,
-            )
-
-            spamms_runtime = (
-                time.perf_counter()
-                - spamms_start
-            )
-
+            process = subprocess.run(command, cwd=self.config.spamms_directory,env=self.config.subprocess_environment(),
+                stdout=(subprocess.DEVNULL if self.config.suppress_stdout else None), stderr=subprocess.PIPE, text=True,
+                timeout=self.config.timeout, check=False)
+            spamms_runtime = (time.perf_counter() - spamms_start)
             if process.returncode != 0:
-                raise RuntimeError(
-                    self._format_failure_message(
-                        parameter_values=parameter_values,
-                        temporary_directory=temporary_directory,
-                        return_code=process.returncode,
-                        stderr=process.stderr,
-                    )
-                )
-
-            models = read_model_spectra(
-                output_directory=output_directory,
-                selected_lines=selected_lines,
-            )
-
+                raise RuntimeError(self._format_failure_message( parameter_values=parameter_values, temporary_directory=temporary_directory,
+                        return_code=process.returncode, stderr=process.stderr))
+            models = read_model_spectra( output_directory=output_directory, selected_lines=selected_lines)
             run_succeeded = True
             self._n_successful += 1
-
             return models
 
         except subprocess.TimeoutExpired as error:
-            raise RuntimeError(
-                self._format_timeout_message(
-                    parameter_values=parameter_values,
-                    temporary_directory=temporary_directory,
-                    timeout=error.timeout,
-                    stderr=error.stderr,
-                )
-            ) from error
-
+            raise RuntimeError(self._format_timeout_message( parameter_values=parameter_values, temporary_directory=temporary_directory, timeout=error.timeout, stderr=error.stderr)) from error
         finally:
-            total_runtime = (
-                time.perf_counter()
-                - run_start
-            )
-
+            total_runtime = (time.perf_counter() - run_start)
             self._last_runtime = total_runtime
             self._total_runtime += total_runtime
-
             if spamms_runtime is not None:
-                self._last_spamms_runtime = (
-                    spamms_runtime
-                )
-
-                self._total_spamms_runtime += (
-                    spamms_runtime
-                )
-
+                self._last_spamms_runtime = (spamms_runtime)
+                self._total_spamms_runtime += ( spamms_runtime)
             if not run_succeeded:
                 self._n_failed += 1
-
-            should_remove = (
-                run_succeeded
-                or not self.config.keep_failed_runs
-            )
-
+            should_remove = ( run_succeeded or not self.config.keep_failed_runs)
             if should_remove:
-                shutil.rmtree(
-                    temporary_directory,
-                    ignore_errors=True,
-                )
+                shutil.rmtree(temporary_directory, ignore_errors=True)
 
     @staticmethod
     def _format_failure_message(
