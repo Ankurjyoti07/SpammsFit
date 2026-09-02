@@ -1,0 +1,28 @@
+object_type = single
+path_to_obs_spectra = None
+output_directory = Outputs/mock_spectra
+path_to_grid = Grids/Demo_Grid
+ntriangles = 10000
+times = [0.0]
+
+teff =                38000
+r_pole =              7
+mass =                18
+inclination =         [55]
+v_crit_frac =         [0.55]
+sigma_R =             [150]
+sigma_T =             [150]
+t0 =                  0.000
+distortion =          roche
+gamma =               0
+gravity_darkening =   EL
+
+he_abundances =       [0.1]
+cno_abundances =      [7.5]
+lp_bins =             161
+
+
+selected_line_list = ['HEII4200', 'HEI4026']
+#selected_he_line_list = ['HEI4471', 'HEI4026', 'HEII4200', 'HEI4387', 'HEII4541' , 'HEI4387', 'HEII4541', 'HEI4143'] 
+#selected_line_list = ['CIII4069', 'CIII4187', 'HDELTA', 'HEI4026', 'HEI4121', 'HEI4143', 'HEI4387', 'HEI4471', 'HEII4200', 'HEII4541', 'HEPS', 'HGAMMA', 'NIII4379', 'NIIIqua', 'NIIItrip', 'NIV4058']
+
